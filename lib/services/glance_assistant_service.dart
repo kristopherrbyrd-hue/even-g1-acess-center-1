@@ -5,8 +5,10 @@ import 'package:even_companion/ble_manager.dart';
 import 'package:even_companion/models/chat_message.dart';
 import 'package:even_companion/models/chat_session_record.dart';
 import 'package:even_companion/services/app_log.dart';
+import 'package:even_companion/services/app_settings_store.dart';
 import 'package:even_companion/services/chat_backend.dart';
 import 'package:even_companion/services/chat_history_store.dart';
+import 'package:even_companion/services/gemini_glasses_service.dart';
 import 'package:even_companion/services/openai_chat_backend.dart';
 import 'package:even_companion/services/openai_transcription_service.dart';
 import 'package:even_companion/services/proto.dart';
@@ -21,7 +23,7 @@ class GlanceAssistantService {
             transcriptionService ?? OpenAiTranscriptionService();
 
   static const _sessionExpiry = Duration(minutes: 4);
-  static const _responseVisibleDuration = Duration(seconds: 6);
+  static const _responseVisibleDuration = Duration(seconds: 12);
   static const _previewDelay = Duration(milliseconds: 900);
   static const _maxGlassesResponseChars = 900;
 
@@ -30,6 +32,7 @@ class GlanceAssistantService {
 
   final ChatBackend _backend;
   final OpenAiTranscriptionService _transcriptionService;
+  final GeminiGlassesService _gemini = GeminiGlassesService();
 
   final List<ChatMessage> _messages = <ChatMessage>[];
   // History session spanning the current ephemeral context window. Created
@@ -50,6 +53,12 @@ class GlanceAssistantService {
   bool get hasEphemeralContext => _messages.isNotEmpty;
 
   Future<String> startListening() async {
+    await AppSettingsStore.get.init();
+    if (AppSettingsStore.get.geminiApiKey.isEmpty) {
+      await _showText('Add Gemini key in Settings');
+      _scheduleClear();
+      return 'Gemini key missing';
+    }
     if (_isThinking) {
       AppLog.debug(
         '${DateTime.now()} start ignored -> still thinking',
@@ -142,8 +151,12 @@ class GlanceAssistantService {
         throw const GlanceAssistantFlowException('No recorded audio to transcribe');
       }
 
-      final transcript = await _transcriptionService.transcribe(filePath);
-      await _deleteTempFile(filePath);
+      String transcript;
+      try {
+        transcript = await _gemini.transcribe(filePath);
+      } finally {
+        await _deleteTempFile(filePath);
+      }
 
       if (!_isCurrentRequest(requestVersion)) {
         return 'Glance assistant request changed';
@@ -174,7 +187,7 @@ class GlanceAssistantService {
 
       await _showText('Thinking...');
       final answer =
-          await _backend.send(messages: List<ChatMessage>.from(_messages));
+          await _gemini.answer(List<ChatMessage>.from(_messages));
 
       if (!_isCurrentRequest(requestVersion)) {
         return 'Glance assistant request changed';
@@ -191,8 +204,7 @@ class GlanceAssistantService {
       _lastActivityAt = DateTime.now();
       _restartSessionExpiryTimer();
 
-      await _showText(cleanedAnswer);
-      _scheduleClear();
+      await _showText('YOU: $cleanedTranscript\n\nGEMINI: $cleanedAnswer');
       return 'Assistant replied';
     } on ChatTranscriptionException catch (e) {
       // The glasses only get a four-word summary, so the status code and
@@ -281,7 +293,8 @@ class GlanceAssistantService {
   Future<void> _showText(String text) async {
     _displayClearTimer?.cancel();
     _isDisplayVisible = true;
-    await TextService.get.startSendText(text);
+    await TextService.get.startSendText(text,
+        pageInterval: Duration(seconds: AppSettingsStore.get.geminiScrollSeconds));
   }
 
   void _scheduleClear() {

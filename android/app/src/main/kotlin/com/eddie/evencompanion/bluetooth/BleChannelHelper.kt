@@ -1,7 +1,12 @@
 package com.eddie.evencompanion.bluetooth
 
 import android.Manifest
+import android.content.ContentValues
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
+import android.provider.MediaStore
+import android.net.Uri
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -151,6 +156,8 @@ class BleMethodChannel(
             "renameRecording" -> renameRecording(call, result)
             "deleteRecording" -> deleteRecording(call, result)
             "shareRecording" -> shareRecording(call, result)
+            "saveGestureProbe" -> saveGestureProbe(call, result)
+            "shareGestureProbe" -> shareGestureProbe(call, result)
             "decodeLc3Frames" -> decodeLc3Frames(call, result)
             "getExternalFilesDir" -> getExternalFilesDir(call, result)
             "requestTelephonyPermissions" -> requestTelephonyPermissions(call, result)
@@ -371,6 +378,62 @@ class BleMethodChannel(
             return
         }
         result.success(GlassesCaptureRecorder.shareRecording(context, uri, displayName))
+    }
+
+    fun saveGestureProbe(call: MethodCall, result: MethodChannel.Result) {
+        val json = (call.arguments as? Map<*, *>)?.get("json") as? String
+        if (json.isNullOrBlank() || json.length > 4_000_000) {
+            result.error("InvalidArguments", "Expected a recording under 4 MB", null)
+            return
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            result.error("Unsupported", "Saving to Downloads requires Android 10 or later", null)
+            return
+        }
+        val name = "G1-gestures-${System.currentTimeMillis()}.json"
+        val resolver = context.contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/Even Companion/")
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        if (uri == null) {
+            result.error("SaveFailed", "Could not create a Downloads file", null)
+            return
+        }
+        try {
+            resolver.openOutputStream(uri)?.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+                ?: error("Could not open output stream")
+            resolver.update(uri, ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }, null, null)
+            result.success(mapOf("uri" to uri.toString(), "name" to name))
+        } catch (error: Exception) {
+            resolver.delete(uri, null, null)
+            result.error("SaveFailed", error.message, null)
+        }
+    }
+
+    fun shareGestureProbe(call: MethodCall, result: MethodChannel.Result) {
+        val args = call.arguments as? Map<*, *>
+        val uri = (args?.get("uri") as? String)?.let(Uri::parse)
+        if (uri == null || uri.scheme != "content") {
+            result.error("InvalidArguments", "Expected a saved content URI", null)
+            return
+        }
+        try {
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "application/json"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(send, "Share G1 recording"))
+            result.success(true)
+        } catch (error: Exception) {
+            result.error("ShareFailed", error.message, null)
+        }
     }
 
     /**

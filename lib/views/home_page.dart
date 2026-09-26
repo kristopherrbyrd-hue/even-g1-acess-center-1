@@ -16,6 +16,7 @@ import 'package:even_companion/views/chat_transcript_page.dart';
 import 'package:even_companion/views/action_center_virtual_hud_page.dart';
 import 'package:even_companion/views/features_page.dart';
 import 'package:even_companion/views/gesture_probe_page.dart';
+import 'package:even_companion/views/touch_routing_probe_page.dart';
 import 'package:even_companion/views/notes_page.dart';
 import 'package:even_companion/views/recordings_page.dart';
 import 'package:even_companion/views/settings_page.dart';
@@ -408,6 +409,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     ),
                   ),
                   child: const Text('Record G1 gestures'),
+                ),
+              if (BleManager.get().isConnected)
+                OutlinedButton(
+                  onPressed: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (context) => const TouchRoutingProbePage()),
+                  ),
+                  child: const Text('Test G1 touch routing'),
                 ),
             ],
           ),

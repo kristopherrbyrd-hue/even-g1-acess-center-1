@@ -292,7 +292,12 @@ class BleManager private constructor() {
      *
      */
     fun disconnectFromGlasses(result: MethodChannel.Result) {
-        Log.i(LOG_TAG, "connectToGlass: G1_${connectedDevice?.deviceName()}")
+        Log.i(LOG_TAG, "Manual disconnect: G1_${connectedDevice?.deviceName()}")
+        closeLegGatt(connectedDevice?.leftDevice, "manual-disconnect")
+        closeLegGatt(connectedDevice?.rightDevice, "manual-disconnect")
+        reconnectInFlight.clear()
+        writeQueues.values.forEach { it.flush("manual-disconnect") }
+        notifyConnectionState("disconnected")
         result.success("Disconnected all devices.")
     }
 

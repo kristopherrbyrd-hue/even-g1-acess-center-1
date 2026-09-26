@@ -12,6 +12,8 @@ class AppSettingsStore extends ChangeNotifier {
   static const _secureStorage = FlutterSecureStorage();
 
   static const _apiKeyStorageKey = 'assistant.api_key';
+  static const _geminiKeyStorageKey = 'assistant.gemini_api_key';
+  static const _geminiScrollPrefKey = 'assistant.gemini_scroll_seconds';
   static const _baseUrlPrefKey = 'assistant.base_url';
   static const _chatModelPrefKey = 'assistant.chat_model';
   static const _transcriptionModelPrefKey = 'assistant.transcription_model';
@@ -43,6 +45,8 @@ class AppSettingsStore extends ChangeNotifier {
   bool _initializing = false;
 
   String _apiKey = '';
+  String _geminiApiKey = '';
+  int _geminiScrollSeconds = 8;
   String _baseUrl = '';
   String _chatModel = '';
   String _transcriptionModel = '';
@@ -56,6 +60,8 @@ class AppSettingsStore extends ChangeNotifier {
 
   bool get isInitialized => _initialized;
   String get apiKey => _apiKey;
+  String get geminiApiKey => _geminiApiKey;
+  int get geminiScrollSeconds => _geminiScrollSeconds;
   String get baseUrl => _baseUrl;
   String get chatModel => _chatModel;
   String get transcriptionModel => _transcriptionModel;
@@ -104,6 +110,10 @@ class AppSettingsStore extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       _apiKey =
           (await _secureStorage.read(key: _apiKeyStorageKey) ?? '').trim();
+      _geminiApiKey =
+          (await _secureStorage.read(key: _geminiKeyStorageKey) ?? '').trim();
+      _geminiScrollSeconds =
+          (prefs.getInt(_geminiScrollPrefKey) ?? 8).clamp(3, 20);
       _baseUrl = (prefs.getString(_baseUrlPrefKey) ?? '').trim();
       _chatModel = (prefs.getString(_chatModelPrefKey) ?? '').trim();
       _transcriptionModel =
@@ -222,6 +232,25 @@ class AppSettingsStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> saveGeminiSettings({
+    required String apiKey,
+    required int scrollSeconds,
+  }) async {
+    await init();
+    final normalized = apiKey.trim();
+    if (normalized.isEmpty) {
+      await _secureStorage.delete(key: _geminiKeyStorageKey);
+    } else {
+      await _secureStorage.write(key: _geminiKeyStorageKey, value: normalized);
+    }
+    final seconds = scrollSeconds.clamp(3, 20);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_geminiScrollPrefKey, seconds);
+    _geminiApiKey = normalized;
+    _geminiScrollSeconds = seconds;
+    notifyListeners();
+  }
+
   /// Persist the user's head-up choice across app restarts.
   ///
   /// Saves only — does not push to the firmware. The companion app's
@@ -329,4 +358,3 @@ class AppSettingsStore extends ChangeNotifier {
     await prefs.setString(key, value);
   }
 }
-

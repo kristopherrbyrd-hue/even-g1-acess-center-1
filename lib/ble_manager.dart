@@ -143,6 +143,7 @@ class BleManager {
   bool isConnected = false;
   String connectionStatus = 'Not connected';
   String? _lastConnectedChannelNumber;
+  bool _manualDisconnect = false;
 
   LegConnectionState legState(String lr) => _legStates[lr]!;
   String? get lastConnectedChannelNumber => _lastConnectedChannelNumber;
@@ -175,6 +176,7 @@ class BleManager {
   }
 
   Future<void> connectToGlasses(String deviceName) async {
+    _manualDisconnect = false;
     try {
       if (deviceName.startsWith('Pair_')) {
         _lastConnectedChannelNumber = deviceName.substring('Pair_'.length);
@@ -190,6 +192,20 @@ class BleManager {
       connectionStatus = 'Connecting...';
     } catch (e) {
       AppLog.error('connectToGlasses failed: $e', tag: 'BLE');
+    }
+  }
+
+  Future<void> disconnectFromGlasses() async {
+    _manualDisconnect = true;
+    _pendingAutoConnectChannel = null;
+    _cancelAutoReconnect(source: 'manualDisconnect');
+    await stopScan();
+    try {
+      await _channel.invokeMethod('disconnectFromGlasses');
+      _onGlassesDisconnected();
+    } catch (e) {
+      AppLog.error('disconnectFromGlasses failed: $e', tag: 'BLE');
+      rethrow;
     }
   }
 
@@ -940,6 +956,7 @@ class BleManager {
   }
 
   Future<void> attemptAutoConnect() async {
+    if (_manualDisconnect) return;
     await AppSettingsStore.get.init();
     final channel = AppSettingsStore.get.lastChannelNumber;
     final lastWearState = AppSettingsStore.get.lastWearState;
@@ -969,6 +986,7 @@ class BleManager {
   }
 
   Future<void> forceReconnect() async {
+    _manualDisconnect = false;
     // Reset per-leg health state so reconnect starts from a clean slate.
     // Without this, stale reconnectAttempts/reconnectInFlight from a
     // previous failed reconnect cycle can leave legs stuck.
@@ -1422,7 +1440,7 @@ class BleManager {
     connectionStatus = _buildConnectionStatus();
     if (wasConnected && !isConnected) {
       _handleFullDisconnect(source: 'ConnectionStateChanged');
-      _maybeStartAutoReconnect();
+      if (!_manualDisconnect) _maybeStartAutoReconnect();
     } else if (wasConnected && isConnected) {
       // Single-leg disconnect: a leg that WAS up has gone down while the other
       // stays up. Gate on the connected->disconnected transition for THIS
@@ -1685,6 +1703,7 @@ class BleManager {
   }
 
   void _maybeStartAutoReconnect() {
+    if (_manualDisconnect) return;
     if (_autoReconnectTimer != null || _autoReconnectAttempt > 0) {
       AppLog.debug(
         '${DateTime.now()} auto-reconnect already active, skipping',

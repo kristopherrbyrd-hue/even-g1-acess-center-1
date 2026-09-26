@@ -2,11 +2,14 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:even_companion/ble_manager.dart';
+import 'package:even_companion/services/action_center_service.dart';
 import 'package:even_companion/services/ble.dart';
+import 'package:even_companion/services/proto.dart';
+import 'package:even_companion/services/text_service.dart';
 import 'package:flutter/material.dart';
 
-/// Passive, guided capture of the packets the G1 actually sends to the phone.
-/// It never changes the active mode or writes anything to the glasses.
+/// A guided diagnostic. Only the short instructions write to the glasses;
+/// observed packets, phone taps, and results never issue a gesture command.
 class GestureProbePage extends StatefulWidget {
   const GestureProbePage({super.key});
 
@@ -14,9 +17,11 @@ class GestureProbePage extends StatefulWidget {
   State<GestureProbePage> createState() => _GestureProbePageState();
 }
 
+enum _ProbePhase { baseline, action, complete }
+
 class _GestureProbePageState extends State<GestureProbePage> {
-  static const prompts = <String>[
-    'Keep still and look forward (baseline)',
+  static const _maxAttempts = 5;
+  static const _prompts = <String>[
     'Look up',
     'Look forward again',
     'Look right quickly',
@@ -30,38 +35,59 @@ class _GestureProbePageState extends State<GestureProbePage> {
     'Tap right pad three times',
     'Tap right pad four times',
     'Hold right pad',
+    'Hold both pads',
     'Tap left pad once',
     'Tap left pad twice',
     'Tap left pad three times',
     'Tap left pad four times',
-    'Hold left pad (may open native Even AI)',
-    'Hold both pads',
+    'Hold left pad (native Even AI may open)',
   ];
 
   StreamSubscription<BleReceive>? _subscription;
-  final List<Map<String, Object?>> _trials = [];
-  final List<Map<String, Object?>> _events = [];
   final DateTime _sessionStart = DateTime.now().toUtc();
-  int _index = 0;
-  bool _capturing = false;
+  final List<Map<String, Object?>> _attempts = [];
+  final List<Map<String, Object?>> _events = [];
+  final Map<String, int> _candidateRepeats = {};
+  final Set<String> _allBaselineSignatures = {};
+  int _promptIndex = 0;
+  int _attemptNumber = 1;
+  _ProbePhase _phase = _ProbePhase.baseline;
+  bool _busy = true;
   bool _saving = false;
   String? _savedUri;
   String? _savedName;
+
+  Map<String, Object?>? _currentAttempt;
+  final Set<String> _baselineSignatures = {};
+  final Set<String> _actionSignatures = {};
 
   @override
   void initState() {
     super.initState();
     _subscription = BleManager.get().eventBleReceive.listen(_onPacket);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _beginBaseline());
+  }
+
+  String _signature(BleReceive packet) =>
+      '${packet.lr}:${packet.hexStringData()}';
+
+  // Replies to our display writes and teardown are recorded, but cannot
+  // persuade the recorder that a gesture has a reliable incoming signal.
+  bool _isGestureCandidate(BleReceive packet) {
+    if (packet.data.isEmpty) return false;
+    return !{0x06, 0x0e, 0x18, 0x4e, 0x50}.contains(packet.data.first);
   }
 
   void _onPacket(BleReceive packet) {
-    if (!_capturing || packet.type == 'VoiceChunk' || packet.data.isEmpty) return;
-    if (_events.length >= 5000) return;
-    // Heartbeats are periodic background traffic and hide the useful events.
-    if (packet.data.first == 0x25) return;
+    if (_busy || _phase == _ProbePhase.complete ||
+        packet.type == 'VoiceChunk' || packet.data.isEmpty ||
+        packet.data.first == 0x25 || _events.length >= 5000) return;
     final now = DateTime.now().toUtc();
+    final signature = _signature(packet);
     _events.add({
-      'trial': _index + 1,
+      'prompt': _promptIndex + 1,
+      'attempt': _attemptNumber,
+      'phase': _phase.name,
       'at': now.toIso8601String(),
       'elapsedMs': now.difference(_sessionStart).inMilliseconds,
       'side': packet.lr,
@@ -69,54 +95,123 @@ class _GestureProbePageState extends State<GestureProbePage> {
       'opcode': '0x${packet.data.first.toRadixString(16).padLeft(2, '0')}',
       'hex': packet.hexStringData(),
     });
+    if (_isGestureCandidate(packet)) {
+      if (_phase == _ProbePhase.baseline) {
+        _baselineSignatures.add(signature);
+      } else {
+        _actionSignatures.add(signature);
+      }
+    }
     if (mounted) setState(() {});
   }
 
-  void _start() {
+  Future<void> _showHud(String message) async {
     if (!BleManager.get().isConnected) return;
-    setState(() {
-      _capturing = true;
-      _trials.add({
-        'number': _index + 1,
-        'prompt': prompts[_index],
-        'startedAt': DateTime.now().toUtc().toIso8601String(),
-      });
-    });
+    await TextService.get.startSendText(message);
   }
 
-  void _finish({bool skipped = false}) {
-    setState(() {
-      if (_capturing) {
-        _trials.last['endedAt'] = DateTime.now().toUtc().toIso8601String();
-        _trials.last['skipped'] = skipped;
-      } else {
-        _trials.add({
-          'number': _index + 1,
-          'prompt': prompts[_index],
-          'skipped': true,
-        });
+  Future<void> _beginBaseline() async {
+    if (!mounted || _phase == _ProbePhase.complete) return;
+    setState(() => _busy = true);
+    _baselineSignatures.clear();
+    _actionSignatures.clear();
+    _currentAttempt = {
+      'prompt': _promptIndex + 1,
+      'action': _prompts[_promptIndex],
+      'attempt': _attemptNumber,
+    };
+    try {
+      await _showHud('Look directly forward\nTap phone screen\n$_attemptNumber/$_maxAttempts');
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    } catch (error) {
+      if (mounted) _showError('Could not show baseline: $error');
+    }
+    if (mounted) {
+      _currentAttempt!['baselineStartedAt'] = DateTime.now().toUtc().toIso8601String();
+      setState(() { _phase = _ProbePhase.baseline; _busy = false; });
+    }
+  }
+
+  Future<void> _onFullScreenTap() async {
+    if (_busy || _phase == _ProbePhase.complete) return;
+    if (!BleManager.get().isConnected) {
+      _showError('Connect the glasses to continue.');
+      return;
+    }
+    setState(() => _busy = true);
+    final now = DateTime.now().toUtc();
+    if (_phase == _ProbePhase.baseline) {
+      _currentAttempt!['baselineEndedAt'] = now.toIso8601String();
+      _allBaselineSignatures.addAll(_baselineSignatures);
+      try {
+        await _showHud('${_prompts[_promptIndex]}\nTap phone screen\nwhen done');
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+        if (mounted) {
+          _currentAttempt!['actionStartedAt'] = DateTime.now().toUtc().toIso8601String();
+          setState(() { _phase = _ProbePhase.action; _busy = false; });
+        }
+      } catch (error) {
+        if (mounted) { setState(() => _busy = false); _showError('Could not show prompt: $error'); }
       }
-      _capturing = false;
-      _index++;
-    });
+      return;
+    }
+
+    _currentAttempt!['actionEndedAt'] = now.toIso8601String();
+    final candidates = _actionSignatures.difference(_allBaselineSignatures);
+    final repeated = <String>[];
+    for (final signature in candidates) {
+      final count = (_candidateRepeats[signature] ?? 0) + 1;
+      _candidateRepeats[signature] = count;
+      if (count >= 2) repeated.add(signature);
+    }
+    final clear = repeated.isNotEmpty;
+    _currentAttempt!['baselineCandidateSignatures'] = _baselineSignatures.toList();
+    _currentAttempt!['actionCandidateSignatures'] = _actionSignatures.toList();
+    _currentAttempt!['newCandidateSignatures'] = candidates.toList();
+    _currentAttempt!['repeatedNonbaselineSignatures'] = repeated;
+    _currentAttempt!['earlyStop'] = clear;
+    _attempts.add(_currentAttempt!);
+    if (clear || _attemptNumber >= _maxAttempts) {
+      _promptIndex++;
+      _attemptNumber = 1;
+      _candidateRepeats.clear();
+      _allBaselineSignatures.clear();
+    } else {
+      _attemptNumber++;
+    }
+    if (_promptIndex >= _prompts.length) {
+      setState(() => _phase = _ProbePhase.complete);
+      await TextService.get.stopTextSendingByOS();
+      await Proto.exit();
+      if (BleManager.get().isConnected && ActionCenterService.enabled) {
+        await ActionCenterService.get.syncDashboard();
+      }
+      if (mounted) setState(() => _busy = false);
+    } else {
+      await _beginBaseline();
+    }
+  }
+
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _save() async {
-    if (_saving || _trials.isEmpty) return;
+    if (_saving || _attempts.isEmpty) return;
     setState(() => _saving = true);
     try {
-      final content = const JsonEncoder.withIndent('  ').convert({
-        'schema': 'even-g1-gesture-probe-v1',
+      final json = const JsonEncoder.withIndent('  ').convert({
+        'schema': 'even-g1-gesture-probe-v2',
         'startedAt': _sessionStart.toIso8601String(),
-        'endedAt': DateTime.now().toUtc().toIso8601String(),
-        'notes': 'Passive incoming BLE control packets. Missing events may be handled locally by G1 firmware. Voice chunks and periodic heartbeats excluded.',
-        'trials': _trials,
+        'savedAt': DateTime.now().toUtc().toIso8601String(),
+        'maxAttempts': _maxAttempts,
+        'earlyStopRule': 'Same exact incoming side and bytes on at least two attempts, absent from their baselines; display response opcodes excluded.',
+        'notes': 'Tap timestamps separate baseline and action. No packet can mean firmware handled the gesture locally. Voice chunks and heartbeats omitted.',
+        'attempts': _attempts,
         'events': _events,
       });
       final result = await BleManager.invokeMethod<Map<dynamic, dynamic>>(
-        'saveGestureProbe',
-        {'json': content},
-      );
+        'saveGestureProbe', {'json': json});
       if (!mounted) return;
       setState(() {
         _savedUri = result?['uri'] as String?;
@@ -124,69 +219,99 @@ class _GestureProbePageState extends State<GestureProbePage> {
       });
       if (_savedUri == null) throw StateError('No saved file URI');
     } catch (error) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not save recording: $error')),
-        );
-      }
+      if (mounted) _showError('Could not save recording: $error');
     } finally {
       if (mounted) setState(() => _saving = false);
     }
   }
 
   Future<void> _share() async {
-    final uri = _savedUri;
-    if (uri == null) return;
-    await BleManager.invokeMethod<bool>('shareGestureProbe', {
-      'uri': uri,
-      'name': _savedName,
-    });
+    if (_savedUri == null) return;
+    try {
+      await BleManager.invokeMethod<bool>('shareGestureProbe', {
+        'uri': _savedUri, 'name': _savedName,
+      });
+    } catch (error) {
+      if (mounted) _showError('Could not share recording: $error');
+    }
   }
 
   @override
   void dispose() {
     _subscription?.cancel();
+    // Stop the diagnostic text only if it still owns the surface.
+    if (_phase != _ProbePhase.complete) {
+      unawaited(_leaveHud());
+    }
     super.dispose();
+  }
+
+  Future<void> _leaveHud() async {
+    await TextService.get.stopTextSendingByOS();
+    if (!BleManager.get().isConnected) return;
+    await Proto.exit();
+    if (ActionCenterService.enabled) await ActionCenterService.get.syncDashboard();
   }
 
   @override
   Widget build(BuildContext context) {
-    final done = _index >= prompts.length;
-    final currentEvents = _events.where((e) => e['trial'] == _index + 1).length;
+    final complete = _phase == _ProbePhase.complete;
+    final label = complete ? 'Recording complete' :
+        _phase == _ProbePhase.baseline ? 'Look directly forward' : _prompts[_promptIndex];
+    final instruction = complete ? 'Save and share the packet file below.' :
+        _phase == _ProbePhase.baseline ? 'Tap anywhere to show the gesture.' :
+        'Do the gesture, then tap anywhere.';
+    final count = _events.where((e) => e['prompt'] == _promptIndex + 1 &&
+        e['attempt'] == _attemptNumber && e['phase'] == _phase.name).length;
     return Scaffold(
-      appBar: AppBar(title: const Text('G1 Gesture Recorder')),
-      body: ListView(
-        padding: const EdgeInsets.all(20),
-        children: [
-          const Text('Follow each prompt while wearing the glasses. Tap Start, do the action, then tap Done. Repeat a gesture a few times if useful. This screen only listens to incoming packets.'),
-          const SizedBox(height: 20),
-          Text(done ? 'All prompts complete' : 'Prompt ${_index + 1} of ${prompts.length}',
-              style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 12),
-          if (!done) Text(prompts[_index], style: Theme.of(context).textTheme.headlineSmall),
-          const SizedBox(height: 20),
-          Text(_capturing ? 'Recording • $currentEvents packets' : '${_events.length} packets captured total'),
-          const SizedBox(height: 16),
-          if (!BleManager.get().isConnected)
-            const Text('Connect the glasses before recording.'),
-          if (!done && !_capturing)
-            FilledButton(onPressed: BleManager.get().isConnected ? _start : null, child: const Text('Start this prompt')),
-          if (!done && _capturing)
-            FilledButton(onPressed: () => _finish(), child: const Text('Done with this prompt')),
-          if (!done)
-            TextButton(onPressed: () => _finish(skipped: true), child: const Text('Skip this prompt')),
-          if (_trials.isNotEmpty) ...[
-            const SizedBox(height: 20),
-            FilledButton.tonal(onPressed: _saving ? null : _save, child: Text(_saving ? 'Saving...' : 'Save recording to Downloads')),
-          ],
-          if (_savedUri != null) ...[
-            const SizedBox(height: 8),
-            Text('Saved: $_savedName'),
-            OutlinedButton(onPressed: _share, child: const Text('Share recording')),
-          ],
-          const SizedBox(height: 20),
-          const Text('Some taps and gaze movements may be handled entirely by G1 firmware. A quiet trial is useful evidence too. Left hold may activate the native Even AI feature.'),
+      appBar: AppBar(
+        title: const Text('G1 Gesture Recorder'),
+        actions: [
+          if (_attempts.isNotEmpty && !complete)
+            IconButton(tooltip: 'Save progress', onPressed: _saving ? null : _save,
+                icon: const Icon(Icons.save_alt)),
         ],
+      ),
+      body: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: complete ? null : _onFullScreenTap,
+        child: SizedBox.expand(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(complete ? '${_prompts.length} gestures' :
+                    'Gesture ${_promptIndex + 1}/${_prompts.length} • Attempt $_attemptNumber/$_maxAttempts'),
+                const SizedBox(height: 28),
+                Text(label, textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.headlineMedium),
+                const SizedBox(height: 22),
+                Text(_busy ? 'Showing prompt on glasses…' : instruction,
+                    textAlign: TextAlign.center),
+                if (!complete) ...[
+                  const SizedBox(height: 16),
+                  Text('$count packets in this phase'),
+                ],
+                if (complete || _savedUri != null) ...[
+                  const SizedBox(height: 30),
+                  FilledButton(onPressed: _saving ? null : _save,
+                      child: Text(_saving ? 'Saving…' : 'Save to Downloads')),
+                  if (_savedUri != null) ...[
+                    const SizedBox(height: 12),
+                    Text('Saved: $_savedName'),
+                    OutlinedButton(onPressed: _share, child: const Text('Share recording')),
+                  ],
+                ],
+                if (!complete) ...[
+                  const SizedBox(height: 26),
+                  const Text('The whole screen is the tap target. Left hold may open native Even AI.',
+                      textAlign: TextAlign.center),
+                ],
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }

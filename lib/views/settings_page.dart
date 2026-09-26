@@ -16,6 +16,9 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage> {
   late final TextEditingController _apiKeyController;
+  late final TextEditingController _geminiKeyController;
+  int _geminiScrollSeconds = 8;
+  bool _obscureGeminiKey = true;
   late final TextEditingController _baseUrlController;
   late final TextEditingController _chatModelController;
   late final TextEditingController _transcriptionModelController;
@@ -29,6 +32,7 @@ class _SettingsPageState extends State<SettingsPage> {
   void initState() {
     super.initState();
     _apiKeyController = TextEditingController();
+    _geminiKeyController = TextEditingController();
     _baseUrlController = TextEditingController();
     _chatModelController = TextEditingController();
     _transcriptionModelController = TextEditingController();
@@ -63,6 +67,8 @@ class _SettingsPageState extends State<SettingsPage> {
   void _applyStoreValues() {
     final settings = AppSettingsStore.get;
     _apiKeyController.text = settings.apiKey;
+    _geminiKeyController.text = settings.geminiApiKey;
+    _geminiScrollSeconds = settings.geminiScrollSeconds;
     _baseUrlController.text = settings.baseUrl;
     _chatModelController.text = settings.chatModel;
     _transcriptionModelController.text = settings.transcriptionModel;
@@ -81,6 +87,10 @@ class _SettingsPageState extends State<SettingsPage> {
         chatModel: _chatModelController.text,
         transcriptionModel: _transcriptionModelController.text,
         transcriptionBaseUrl: _transcriptionBaseUrlController.text,
+      );
+      await AppSettingsStore.get.saveGeminiSettings(
+        apiKey: _geminiKeyController.text,
+        scrollSeconds: _geminiScrollSeconds,
       );
       if (!mounted) {
         return;
@@ -236,6 +246,47 @@ class _SettingsPageState extends State<SettingsPage> {
       ),
     );
   }
+
+  Widget _buildGeminiSection() => _buildSectionCard(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Left hold · Gemini',
+                style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            const Text('Hold the left pad to ask. Release to transcribe and answer. Your question and the answer appear on the glasses.'),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _geminiKeyController,
+              obscureText: _obscureGeminiKey,
+              decoration: InputDecoration(
+                labelText: 'Gemini API key',
+                suffixIcon: IconButton(
+                  onPressed: () => setState(() =>
+                      _obscureGeminiKey = !_obscureGeminiKey),
+                  icon: Icon(_obscureGeminiKey
+                      ? Icons.visibility : Icons.visibility_off),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text('Page advance: $_geminiScrollSeconds seconds'),
+            Slider(
+              value: _geminiScrollSeconds.toDouble(),
+              min: 3,
+              max: 20,
+              divisions: 17,
+              label: '${_geminiScrollSeconds}s',
+              onChanged: (value) =>
+                  setState(() => _geminiScrollSeconds = value.round()),
+            ),
+            FilledButton(
+              onPressed: _saving ? null : _save,
+              child: Text(_saving ? 'Saving...' : 'Save Gemini settings'),
+            ),
+          ],
+        ),
+      );
 
   Widget _buildConfigChip({required String label}) {
     return Container(
@@ -554,6 +605,8 @@ class _SettingsPageState extends State<SettingsPage> {
           : ListView(
               padding: const EdgeInsets.all(16),
               children: [
+                _buildGeminiSection(),
+                const SizedBox(height: 16),
                 _buildApiSection(),
                 const SizedBox(height: 16),
                 _buildNotificationFiltersSection(),
@@ -573,6 +626,7 @@ class _SettingsPageState extends State<SettingsPage> {
     CompanionController.get.removeListener(_handleStoreChanged);
     DeviceStatusService.get.removeListener(_handleStoreChanged);
     _apiKeyController.dispose();
+    _geminiKeyController.dispose();
     _baseUrlController.dispose();
     _chatModelController.dispose();
     _transcriptionModelController.dispose();

@@ -260,12 +260,12 @@ class _SettingsPageState extends State<SettingsPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'Notification Filters',
+            'Apps on glasses',
             style: Theme.of(context).textTheme.titleMedium,
           ),
           const SizedBox(height: 8),
           Text(
-            'Suppress noisy packages or mark media apps for the Now Playing line.',
+            'Choose which apps can show notifications in Action Center. Apps appear here after they send a notification.',
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                   color: const Color(0xFF9AB7C8),
                 ),
@@ -280,7 +280,7 @@ class _SettingsPageState extends State<SettingsPage> {
             )
           else ...[
             _buildSwitchColumnHeaders(),
-            ...packages.take(20).map(_buildPackageRow),
+            ...packages.map(_buildPackageRow),
           ],
         ],
       ),
@@ -307,7 +307,7 @@ class _SettingsPageState extends State<SettingsPage> {
         SizedBox(
           width: _switchColumnWidth,
           child: Text(
-            'Mute',
+            'Show',
             style: headerStyle,
             textAlign: TextAlign.center,
           ),
@@ -361,11 +361,11 @@ class _SettingsPageState extends State<SettingsPage> {
           SizedBox(
             width: _switchColumnWidth,
             child: Switch(
-              value: entry.suppressed,
+              value: !entry.suppressed,
               onChanged: (value) async {
                 await NotificationSettingsStore.get.setPackageSuppressed(
                   entry.packageName,
-                  value,
+                  !value,
                 );
                 await CompanionController.get.refreshCompanionState();
               },

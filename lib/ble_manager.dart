@@ -334,6 +334,14 @@ class BleManager {
     await Future<void>.delayed(const Duration(milliseconds: 50));
     AppLog.info('${DateTime.now()} time sync: initial push', tag: tag);
     await Proto.setTimeAndWeather();
+
+    // Notification hydration can finish before either BLE leg connects. Its
+    // dashboard writes are then skipped by the transport, so replay the pane
+    // and current cards once the connection has settled.
+    if (isConnected && ActionCenterService.enabled) {
+      AppLog.info('${DateTime.now()} Action Center dashboard: replay after connect', tag: tag);
+      await ActionCenterService.get.syncDashboard();
+    }
   }
 
   void startSendBeatHeart() async {

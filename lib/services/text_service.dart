@@ -14,11 +14,16 @@ class TextService {
   static List<String> list = [];
   static List<String> sendReplys = [];
   static String? _lastSentText;
+  static Duration _pageInterval = const Duration(seconds: 8);
 
   TextService._(); 
 
-  Future startSendText(String text) async {
+  Future startSendText(String text, {
+    Duration pageInterval = const Duration(seconds: 8),
+  }) async {
     isRunning = true;
+    _timer?.cancel();
+    _pageInterval = pageInterval;
     _lastSentText = text;
 
     _currentLine = 0;
@@ -88,10 +93,8 @@ class TextService {
 
   Future updateReplyToOSByTimer() async {
     if (!isRunning) return;
-    int interval = 8; // The paging interval can be customized
-   
     _timer?.cancel();
-    _timer = Timer.periodic(Duration(seconds: interval), (timer) async {
+    _timer = Timer.periodic(_pageInterval, (timer) async {
 
       _currentLine = min(_currentLine + 5, list.length - 1);
       sendReplys = list.sublist(_currentLine);

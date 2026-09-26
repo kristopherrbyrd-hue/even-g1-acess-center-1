@@ -15,6 +15,7 @@ import 'package:even_companion/services/phone_capture_service.dart';
 import 'package:even_companion/views/chat_transcript_page.dart';
 import 'package:even_companion/views/action_center_virtual_hud_page.dart';
 import 'package:even_companion/views/features_page.dart';
+import 'package:even_companion/views/gesture_probe_page.dart';
 import 'package:even_companion/views/notes_page.dart';
 import 'package:even_companion/views/recordings_page.dart';
 import 'package:even_companion/views/settings_page.dart';
@@ -397,6 +398,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 OutlinedButton(
                   onPressed: _disconnect,
                   child: const Text('Disconnect'),
+                ),
+              if (BleManager.get().isConnected)
+                OutlinedButton(
+                  onPressed: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => const GestureProbePage(),
+                    ),
+                  ),
+                  child: const Text('Record G1 gestures'),
                 ),
             ],
           ),

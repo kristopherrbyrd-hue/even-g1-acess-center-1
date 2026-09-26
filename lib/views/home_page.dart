@@ -153,6 +153,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _refreshPage();
   }
 
+  Future<void> _disconnect() async {
+    scanTimer?.cancel();
+    setState(() => isScanning = false);
+    try {
+      await BleManager.get().disconnectFromGlasses();
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not disconnect the glasses.')),
+        );
+      }
+    }
+    _refreshPage();
+  }
+
   Widget _buildModeButton(AppMode mode, {bool enabled = true}) {
     final isSelected = CompanionController.get.activeMode == mode;
     return Expanded(
@@ -378,6 +393,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 onPressed: _forceReconnect,
                 child: const Text('Force Reconnect'),
               ),
+              if (BleManager.get().isConnected)
+                OutlinedButton(
+                  onPressed: _disconnect,
+                  child: const Text('Disconnect'),
+                ),
             ],
           ),
           if (!_showCompactConnection) ...[

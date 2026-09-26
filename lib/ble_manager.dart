@@ -555,13 +555,17 @@ class BleManager {
           // Action Center v0.2 deliberately leaves the firmware dashboard in
           // control so local single-tap paging works. The old Glance handler
           // would replace it with a host-rendered 0x4E surface.
-          if (!ActionCenterService.enabled) {
+          if (!ActionCenterService.enabled ||
+              (CompanionController.get.activeMode != AppMode.glance &&
+                  !ActionCenterService.get.ownsInteractiveDisplay)) {
             CompanionController.get.handleGlassesGesture(notifyIndex, res.lr);
           }
           break;
         case 3:
           ActionCenterService.get.handleDashboardBoundary(open: false);
-          if (!ActionCenterService.enabled) {
+          if (!ActionCenterService.enabled ||
+              (CompanionController.get.activeMode != AppMode.glance &&
+                  !ActionCenterService.get.ownsInteractiveDisplay)) {
             CompanionController.get.handleGlassesGesture(notifyIndex, res.lr);
           }
           break;

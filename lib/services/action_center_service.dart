@@ -123,7 +123,6 @@ class ActionCenterService {
     _liveCardsBeforeVirtual = null;
     _virtualMode = false;
     _dashboardVisible = false;
-    await syncDashboard();
   }
 
   String get virtualDisplayText {

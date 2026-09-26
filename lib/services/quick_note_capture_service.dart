@@ -1,0 +1,349 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:even_companion/ble_manager.dart';
+import 'package:even_companion/services/app_log.dart';
+import 'package:even_companion/services/notes_store.dart';
+import 'package:even_companion/services/openai_transcription_service.dart';
+import 'package:even_companion/services/proto.dart';
+import 'package:even_companion/services/quick_note_classifier.dart';
+import 'package:even_companion/services/quick_note_tidy_service.dart';
+
+/// Receives a flushed QuickNote audio payload from the BLE layer, decodes it
+/// from LC3 to PCM via the native JNI decoder, transcribes via OpenAI Whisper,
+/// and stores the result in [NotesStore] with async GPT tidy and classification.
+class QuickNoteCaptureService {
+  QuickNoteCaptureService._();
+
+  static QuickNoteCaptureService? _instance;
+  static QuickNoteCaptureService get get =>
+      _instance ??= QuickNoteCaptureService._();
+
+  static const _tag = 'QuickNoteCapture';
+  static const _sampleRate = 16000;
+  static const _channelCount = 1;
+  static const _bitsPerSample = 16;
+
+  // LC3 frame size is 200 bytes (confirmed). 80/40 are standard fallbacks.
+  static const _frameSizeCandidates = [200, 80, 40];
+
+  static const _subDir = 'quicknote';
+
+  /// Entry point called by [BleManager._methodCallHandler] when Kotlin fires
+  /// `quickNoteAudioReady`. Runs asynchronously — returns immediately.
+  Future<void> handleAudioReady(Uint8List noteUid, Uint8List audio) async {
+    // Clear the capture-active flag so clearDisplay() resumes working.
+    Proto.quickNoteCaptureComplete();
+
+    // Send the firmware ack (04 01) immediately to close the transfer cycle.
+    // Must fire unconditionally — even if decode/STT fails, the firmware
+    // needs to know we received the audio so the next long-press works.
+    unawaited(Proto.quickNoteAck(lr: 'R'));
+
+    final uidHex = noteUid
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+    final timestamp = DateTime.now()
+        .toIso8601String()
+        .replaceAll(':', '-')
+        .replaceAll('.', '-');
+
+    AppLog.info(
+      '${DateTime.now()} QuickNote audio received: uidHex=$uidHex audioBytes=${audio.length}',
+      tag: _tag,
+    );
+
+    if (audio.isEmpty) {
+      AppLog.info(
+        '${DateTime.now()} audio payload is empty — nothing to decode',
+        tag: _tag,
+      );
+      return;
+    }
+
+    final outputDir = await _resolveOutputDir();
+    if (outputDir == null) {
+      AppLog.error(
+        '${DateTime.now()} external files dir unavailable — cannot write WAV',
+        tag: _tag,
+      );
+      return;
+    }
+
+    String? successWavPath;
+    for (final frameSize in _frameSizeCandidates) {
+      final pcm = await _decodeLc3(audio, frameSize);
+      if (pcm == null) continue;
+      if (pcm.isEmpty) {
+        AppLog.debug(
+          '${DateTime.now()} frameSize=$frameSize produced 0 PCM bytes — trying next candidate',
+          tag: _tag,
+        );
+        continue;
+      }
+
+      final fileName = '${timestamp}_${uidHex}.wav';
+      final wavPath = '$outputDir/$fileName';
+      try {
+        await _writeWav(wavPath, pcm);
+        AppLog.debug(
+          '${DateTime.now()} WAV saved: $wavPath (frameSize=$frameSize pcmBytes=${pcm.length})',
+          tag: _tag,
+        );
+        successWavPath = wavPath;
+        break;
+      } catch (e) {
+        AppLog.error(
+          '${DateTime.now()} WAV write failed for frameSize=$frameSize: $e',
+          tag: _tag,
+        );
+      }
+    }
+
+    if (successWavPath == null) {
+      AppLog.error(
+        '${DateTime.now()} all frame-size candidates failed — no WAV written for uidHex=$uidHex',
+        tag: _tag,
+      );
+      return;
+    }
+
+    // --- STT → NotesStore → async tidy ---
+    await _transcribeAndStore(successWavPath, noteUid);
+  }
+
+  /// Transcribes [wavPath] via OpenAI Whisper, inserts into [NotesStore],
+  /// then asynchronously tidies the raw transcript and updates the row.
+  Future<void> _transcribeAndStore(String wavPath, Uint8List noteUid) async {
+    final createdAt = DateTime.now().millisecondsSinceEpoch;
+
+    // Step 1: Transcribe the WAV.
+    String? rawTranscript;
+    String? error;
+    try {
+      final stt = OpenAiTranscriptionService();
+      rawTranscript = await stt.transcribe(wavPath);
+      AppLog.info(
+        '${DateTime.now()} STT result: "${rawTranscript.length > 80 ? '${rawTranscript.substring(0, 80)}...' : rawTranscript}"',
+        tag: _tag,
+      );
+    } on ChatTranscriptionException catch (e) {
+      AppLog.error('${DateTime.now()} STT failed: $e', tag: _tag);
+      error = e.message;
+    } catch (e) {
+      AppLog.error('${DateTime.now()} STT unexpected error: $e', tag: _tag);
+      error = e.toString();
+    }
+
+    // Step 2: Insert into NotesStore immediately (raw transcript visible in UI).
+    // Use the keyword classifier for an initial category. The async tidy step
+    // will overwrite this with the LLM-classified value if it succeeds.
+    final initialCategory = QuickNoteClassifier.classify(rawTranscript ?? '');
+    final noteId = await NotesStore.get.insert(
+      createdAt: createdAt,
+      transcriptRaw: rawTranscript,
+      status: 'active',
+      sortOrder: createdAt.toDouble(),
+      noteUid: noteUid,
+      category: initialCategory,
+      error: error,
+    );
+    AppLog.info(
+      '${DateTime.now()} note inserted: id=$noteId raw=${rawTranscript != null ? "yes" : "no"} error=${error ?? "none"}',
+      tag: _tag,
+    );
+
+    // Step 3: Delete the temporary WAV — no longer needed after STT.
+    try {
+      await File(wavPath).delete();
+    } catch (_) {}
+
+    // Step 4: If raw transcript exists, tidy it asynchronously.
+    if (rawTranscript != null && rawTranscript.isNotEmpty) {
+      _tidyAsync(noteId, rawTranscript);
+    }
+  }
+
+  /// Runs the tidy service in the background. Does not block the caller.
+  /// If tidy fails, the raw transcript remains — the note is still usable.
+  /// On failure, the keyword classifier provides a category fallback.
+  ///
+  /// Known limitation: if the user swipe-deletes this note and taps Undo
+  /// while tidy is in-flight, the restored note gets a new autoincrement ID.
+  /// The tidy closure still holds the old ID, so the update is a silent no-op.
+  /// The restored note keeps its raw transcript. Acceptable for v1.
+  void _tidyAsync(int noteId, String rawTranscript) {
+    unawaited(() async {
+      try {
+        final result = await _callTidyService(rawTranscript);
+        final tidiedText = result.text;
+        final category = result.category;
+
+        if (tidiedText.isNotEmpty && tidiedText != rawTranscript) {
+          await NotesStore.get.updateTranscriptClean(
+            id: noteId,
+            transcriptClean: tidiedText,
+          );
+          AppLog.debug(
+            '${DateTime.now()} tidy complete for note $noteId: '
+            '"${tidiedText.length > 60 ? '${tidiedText.substring(0, 60)}...' : tidiedText}"',
+            tag: _tag,
+          );
+        }
+
+        await NotesStore.get.updateCategory(id: noteId, category: category);
+        AppLog.debug(
+          '${DateTime.now()} category set for note $noteId: $category',
+          tag: _tag,
+        );
+      } catch (e) {
+        AppLog.error(
+          '${DateTime.now()} tidy failed for note $noteId: $e',
+          tag: _tag,
+        );
+        // Fall back to keyword classification so the note has a meaningful
+        // category even when the LLM call errors.
+        try {
+          final fallbackCategory =
+              QuickNoteClassifier.classify(rawTranscript);
+          await NotesStore.get.updateCategory(
+            id: noteId,
+            category: fallbackCategory,
+          );
+          AppLog.debug(
+            '${DateTime.now()} keyword fallback category for note $noteId: $fallbackCategory',
+            tag: _tag,
+          );
+        } catch (updateError) {
+          AppLog.error(
+            '${DateTime.now()} category fallback update failed for note $noteId: $updateError',
+            tag: _tag,
+          );
+        }
+      }
+    }());
+  }
+
+  /// Calls the tidy service to clean up the raw transcript.
+  Future<({String text, String category})> _callTidyService(
+    String rawTranscript,
+  ) async {
+    return QuickNoteTidyService.get.tidy(rawTranscript);
+  }
+
+  /// Calls the native `decodeLc3Frames` method with the given [audio] bytes and
+  /// [frameSize]. Returns the decoded PCM as a [Uint8List], or `null` on error.
+  Future<Uint8List?> _decodeLc3(Uint8List audio, int frameSize) async {
+    try {
+      final result = await BleManager.invokeMethod<Uint8List>(
+        'decodeLc3Frames',
+        {'audio': audio, 'frameSize': frameSize},
+      );
+      if (result == null) {
+        AppLog.error(
+          '${DateTime.now()} decodeLc3Frames returned null for frameSize=$frameSize',
+          tag: _tag,
+        );
+        return null;
+      }
+      AppLog.debug(
+        '${DateTime.now()} decodeLc3Frames: frameSize=$frameSize pcmBytes=${result.length}',
+        tag: _tag,
+      );
+      return result;
+    } catch (e) {
+      AppLog.error(
+        '${DateTime.now()} decodeLc3Frames error frameSize=$frameSize: $e',
+        tag: _tag,
+      );
+      return null;
+    }
+  }
+
+  /// Writes a 44-byte RIFF/WAV header followed by [pcm] bytes to [filePath].
+  ///
+  /// Parameters match [GlassesCaptureRecorder]: 16000 Hz, mono, 16-bit LE PCM.
+  Future<void> _writeWav(String filePath, Uint8List pcm) async {
+    final file = File(filePath);
+    await file.parent.create(recursive: true);
+
+    final header = _buildWavHeader(pcm.length);
+    final sink = file.openWrite();
+    sink.add(header);
+    sink.add(pcm);
+    await sink.flush();
+    await sink.close();
+  }
+
+  /// Builds the 44-byte RIFF/WAV header for [pcmByteCount] bytes of audio.
+  ///
+  /// Format: PCM (1), mono (1 channel), 16000 Hz, 16-bit samples, little-endian.
+  Uint8List _buildWavHeader(int pcmByteCount) {
+    const int headerSize = 44;
+    const int fmtChunkSize = 16;
+    const int audioFormat = 1; // PCM
+    const int byteRate = _sampleRate * _channelCount * _bitsPerSample ~/ 8;
+    const int blockAlign = _channelCount * _bitsPerSample ~/ 8;
+
+    final data = ByteData(headerSize);
+    int offset = 0;
+
+    // RIFF chunk descriptor
+    _writeAscii(data, offset, 'RIFF');
+    offset += 4;
+    data.setUint32(offset, pcmByteCount + 36, Endian.little);
+    offset += 4;
+    _writeAscii(data, offset, 'WAVE');
+    offset += 4;
+
+    // fmt sub-chunk
+    _writeAscii(data, offset, 'fmt ');
+    offset += 4;
+    data.setUint32(offset, fmtChunkSize, Endian.little);
+    offset += 4;
+    data.setUint16(offset, audioFormat, Endian.little);
+    offset += 2;
+    data.setUint16(offset, _channelCount, Endian.little);
+    offset += 2;
+    data.setUint32(offset, _sampleRate, Endian.little);
+    offset += 4;
+    data.setUint32(offset, byteRate, Endian.little);
+    offset += 4;
+    data.setUint16(offset, blockAlign, Endian.little);
+    offset += 2;
+    data.setUint16(offset, _bitsPerSample, Endian.little);
+    offset += 2;
+
+    // data sub-chunk
+    _writeAscii(data, offset, 'data');
+    offset += 4;
+    data.setUint32(offset, pcmByteCount, Endian.little);
+
+    return data.buffer.asUint8List();
+  }
+
+  void _writeAscii(ByteData data, int offset, String text) {
+    for (int i = 0; i < text.length; i++) {
+      data.setUint8(offset + i, text.codeUnitAt(i));
+    }
+  }
+
+  /// Returns the absolute path to the `quicknote` subdirectory inside the
+  /// app's primary external files dir, or `null` if unavailable.
+  Future<String?> _resolveOutputDir() async {
+    try {
+      final base = await BleManager.invokeMethod<String>('getExternalFilesDir');
+      if (base == null || base.isEmpty) {
+        return null;
+      }
+      return '$base/$_subDir';
+    } catch (e) {
+      AppLog.error(
+        '${DateTime.now()} getExternalFilesDir failed: $e',
+        tag: _tag,
+      );
+      return null;
+    }
+  }
+}

@@ -18,15 +18,11 @@ jobs:
           channel: stable
           flutter-version: "3.35.7"
           cache: true
-      - name: Unpack v0.5 source
-        run: mkdir app && unzip -q source.zip -d app
       - name: Install dependencies
-        working-directory: app
         run: flutter pub get
       - name: Build ARM64 debug APK
-        working-directory: app
         run: flutter build apk --debug --target-platform android-arm64
       - uses: actions/upload-artifact@v4
         with:
           name: even-g1-action-center-arm64-debug
-          path: app/build/app/outputs/flutter-apk/app-debug.apk
+          path: build/app/outputs/flutter-apk/app-debug.apk

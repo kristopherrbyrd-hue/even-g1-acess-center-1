@@ -227,7 +227,6 @@ class NotificationSettingsStore extends ChangeNotifier {
       'notification_package_preferences',
       orderBy:
           'CASE WHEN last_seen_at IS NULL THEN 1 ELSE 0 END, last_seen_at DESC, display_name ASC',
-      limit: 20,
     );
     _recentPackages = rows
         .map(NotificationPackagePreference.fromMap)

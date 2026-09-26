@@ -248,6 +248,21 @@ class Proto {
   static Future<void> setDashboardCalendarCards(
     List<({String title, String subtitle, String body})> cards,
   ) async {
+    // The firmware's packet length is one byte. Four cards need a fixed
+    // per-field byte budget, including multibyte Unicode, to stay below 255.
+    String fitUtf8(String value, int limit) {
+      final result = StringBuffer();
+      var size = 0;
+      for (final rune in value.runes) {
+        final character = String.fromCharCode(rune);
+        final width = utf8.encode(character).length;
+        if (size + width > limit) break;
+        result.write(character);
+        size += width;
+      }
+      return result.toString();
+    }
+
     final payload = <int>[
       0x03, // calendar pane records
       0x01, 0x00, 0x01, 0x00, // one chunk, chunk index 1
@@ -255,9 +270,9 @@ class Proto {
       cards.length & 0xff,
     ];
     for (final card in cards) {
-      final a = utf8.encode(card.title);
-      final b = utf8.encode(card.subtitle);
-      final c = utf8.encode(card.body);
+      final a = utf8.encode(fitUtf8(card.title, 20));
+      final b = utf8.encode(fitUtf8(card.subtitle, 10));
+      final c = utf8.encode(fitUtf8(card.body, 20));
       if (a.length > 255 || b.length > 255 || c.length > 255) {
         throw ArgumentError('Action Center dashboard field exceeds 255 bytes');
       }
